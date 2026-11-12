@@ -160,7 +160,7 @@ h1 {
 .how li { display: flex; gap: 10px; align-items: baseline; }
 .how b {
   flex: none;
-  min-width: 52px;
+  min-width: 58px;
   font-family: var(--display);
   font-weight: 600;
   color: var(--barn);
@@ -247,7 +247,7 @@ h2 {
 </style>
 </head>
 <body>
-<canvas id="game" aria-label="Little Puff game. Blow into the microphone, or press and hold, to keep the cloud in the air."></canvas>
+<canvas id="game" aria-label="Little Puff game. Press and hold to lift the cloud. Blow into the microphone for a short jet."></canvas>
 
 <div class="hud" id="hud" hidden>
   <div class="pill" id="score">0 m</div>
@@ -258,13 +258,14 @@ h2 {
 <section class="overlay" id="start">
   <header>
     <h1>Little Puff</h1>
-    <p class="tag">A cloud you keep in the air with your own breath.</p>
+    <p class="tag">Keep a cloud out of a vacuum. Hold to rise, blow for a jet.</p>
   </header>
   <div class="panel">
     <ul class="how">
-      <li><b>Blow</b><span>toward the bottom of your phone and Puff rises. Stop and she drifts down.</span></li>
+      <li><b>Hold</b><span>the screen and the vacuum reverses, gusting Puff upward.</span></li>
+      <li><b>Let go</b><span>and it sucks her straight back down. Fast.</span></li>
+      <li><b>Blow</b><span>once for a short jet. A harder blow makes a bigger jet, then the meter has to refill.</span></li>
       <li><b>Dodge</b><span>windmills, storm clouds, birds and the odd airplane.</span></li>
-      <li><b>Easy</b><span>does it. A hard blow swells her up, and tight gaps get tighter.</span></li>
     </ul>
     <div class="actions">
       <button class="btn" id="startBtn" type="button">Start</button>
@@ -276,14 +277,14 @@ h2 {
       <button type="button" data-sens="med">Medium</button>
       <button type="button" data-sens="high">High</button>
     </div>
-    <p class="fine">Start asks for your microphone. If there isn't one, press and hold the screen to blow.</p>
+    <p class="fine">Start asks for your microphone, which powers the jet. Without one, holding still works.</p>
     <p class="ver" id="ver"></p>
   </div>
 </section>
 
 <section class="overlay end" id="over" hidden>
   <div class="panel">
-    <h2>Puff rained out</h2>
+    <h2 id="overTitle">Puff rained out</h2>
     <p class="result"><strong id="finalScore">0 m</strong><span id="bestScore">Best 0 m</span></p>
     <div class="actions">
       <button class="btn" id="againBtn" type="button">Fly again</button>
@@ -302,7 +303,7 @@ h2 {
 <script>
 (() => {
   'use strict';
-  const VERSION = 'v0.2';
+  const VERSION = 'v0.4';
   const TAU = Math.PI * 2;
   const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
   const lerp = (a, b, t) => a + (b - a) * t;
@@ -375,7 +376,7 @@ h2 {
       an.smoothingTimeConstant = 0.55;
       src.connect(an);
       audio = { actx, an, buf: new Float32Array(an.fftSize), bytes: new Uint8Array(an.fftSize),
-        db: null, floor: null, quiet: 0, peak: -100 };
+        db: null, floor: null, quiet: 0, peak: -100, over: -99 };
       return true;
     } catch (_) {
       try { actx.close(); } catch (__) {}
@@ -403,13 +404,15 @@ h2 {
     const db = 20 * Math.log10(Math.max(Math.sqrt(sum / n), 1e-5));
     a.db = a.db === null ? db : a.db + (db - a.db) * 0.35;
     if (a.floor === null) a.floor = Math.min(a.db, -30);
-    const thr = Math.max(a.floor + 14, -34) + SENS[sens];
+    const thr = Math.max(a.floor + 10, -40) + SENS[sens];
     // follow the room only while nobody is blowing; creep very slowly otherwise
     a.floor += (a.db - a.floor) * (a.db < thr ? 0.02 : 0.0005);
     a.floor = Math.min(a.floor, -30);
     a.quiet = a.floor;
     if (a.db > a.peak) a.peak = a.db;
-    return clamp((a.db - thr) / 20, 0, 1);
+    a.over = a.db - thr;
+    // 12 dB from first response to full lift, and a curve that favours soft breaths
+    return Math.pow(clamp((a.db - thr) / 12, 0, 1), 0.6);
   }
 
   // ---------- state ----------
@@ -420,6 +423,15 @@ h2 {
   const player = { x: 0, y: 0, vy: 0, puff: 0, blink: 2 };
   let best = 0;
   try { best = parseInt(localStorage.getItem('littlePuffBest') || '0', 10) || 0; } catch (_) {}
+
+  // airflow between the vacuum and Puff: -1 = sucking down, +1 = gusting up
+  // Jet: one blow fires a short boost sized by how hard you blew, then the meter must refill.
+  const JET_DUR = 0.45, JET_REFILL = 3.0, HOLD_LIFT = 0.62;
+  let charge = 1, jetT = -1, jetPeak = 0, armed = false;
+  const jetStrength = () => clamp((jetPeak - 4) / 22, 0, 1);
+  let flow = -0.5;
+  const streaks = [];
+  for (let i = 0; i < 20; i++) streaks.push({ u: rand(-1, 1), s: Math.random(), len: rand(0.05, 0.1), w: rand(1.5, 3) });
 
   const decor = [];
   for (let i = 0; i < 5; i++) decor.push({ x: Math.random(), y: rand(0.08, 0.5), s: rand(0.6, 1.3), v: rand(0.004, 0.012) });
@@ -432,16 +444,18 @@ h2 {
     player.y = H * 0.42; player.vy = 0; player.puff = 0;
     holding = false;
     if (audio) audio.peak = -100;
+    charge = 1; jetT = -1; jetPeak = 0; armed = false;
     startEl.hidden = true; overEl.hidden = true; hud.hidden = false;
     scoreEl.textContent = '0 m';
-    modeEl.textContent = audio ? 'Blow' : 'Hold';
-    hintEl.textContent = audio ? 'Blow to rise' : 'Press and hold to rise';
+    modeEl.textContent = audio ? 'Jet' : 'Hold';
+    hintEl.textContent = audio ? 'Hold to rise. Blow once for a jet.' : 'Press and hold to rise';
     hintEl.classList.remove('gone');
     setTimeout(() => hintEl.classList.add('gone'), 3500);
   }
 
-  function endGame() {
+  function endGame(reason) {
     state = 'over';
+    $('overTitle').textContent = reason === 'vac' ? 'Puff got vacuumed' : 'Puff rained out';
     overT = 0;
     for (let i = 0; i < 28; i++) {
       const a = rand(0, TAU), sp = rand(0.1, 0.5) * H;
@@ -546,12 +560,44 @@ h2 {
     t += dt;
     player.x = Math.max(W * 0.22, baseR * 2.4);
 
-    const target = Math.max(readBreath(), holding ? 0.8 : 0);
+    readBreath();
+    if (audio && state === 'play') {
+      if (jetT < 0) {
+        charge = Math.min(1, charge + dt / JET_REFILL);
+        if (audio.over < 0) armed = true;            // needs a fresh blow, not one long one
+        if (charge >= 1 && armed && audio.over > 4) {
+          jetT = 0; jetPeak = audio.over; charge = 0; armed = false;
+          for (let i = 0; i < 16; i++) {
+            parts.push({ kind: 'air', x: player.x + rand(-0.6, 0.6) * baseR, y: groundY - 4,
+              vx: rand(-0.08, 0.08) * H, vy: -H * rand(0.9, 1.5), life: rand(0.3, 0.55), r: rand(4, 9) });
+          }
+        }
+      } else {
+        jetT += dt;
+        if (jetT < 0.2) jetPeak = Math.max(jetPeak, audio.over);
+        if (jetT >= JET_DUR) jetT = -1;
+      }
+    }
+    const target = holding ? HOLD_LIFT : 0;
     blow += (target - blow) * Math.min(1, dt * (target > blow ? 14 : 8));
-    meterFill.style.transform = 'scaleX(' + blow.toFixed(3) + ')';
+    if (audio) {
+      meterFill.style.transform = 'scaleX(' + charge.toFixed(3) + ')';
+      meterFill.style.background = charge >= 1 ? '#e2553f' : '';
+    } else {
+      meterFill.style.transform = 'scaleX(' + (blow / HOLD_LIFT).toFixed(3) + ')';
+    }
 
     player.blink -= dt;
     if (player.blink < -0.12) player.blink = rand(2, 5);
+
+    const jetOn = jetT >= 0;
+    const flowTarget = state === 'over' ? 0 : state === 'title' ? -0.5 : (blow > 0.12 || jetOn ? 1 : -1);
+    flow += (flowTarget - flow) * Math.min(1, dt * 10);
+    for (const k of streaks) {
+      k.s += flow * dt * (flow > 0 ? (jetOn ? 4.2 : 2.1) : 1.6);
+      if (k.s > 1) { k.s -= 1; k.u = rand(-1, 1); }
+      else if (k.s < 0) { k.s += 1; k.u = rand(-1, 1); }
+    }
 
     let speed = 0;
     if (state === 'title') {
@@ -564,18 +610,25 @@ h2 {
       speed = clamp(W * 0.38, 120, 300) * lerp(1, 1.6, diff);
 
       // floaty vertical physics
-      const g = H * 0.5, lift = H * 1.5;
+      // the vacuum pulls hard; blowing flips it into a gust that more than cancels the pull
+      const g = H * 1.15 * clamp(playT / 1.2, 0.25, 1), lift = H * 2.7;
       player.vy += (g - lift * blow) * dt;
+      if (jetOn) player.vy -= H * lerp(2.2, 5.0, jetStrength()) * (1 - jetT / JET_DUR) * dt;
       player.vy *= Math.max(0, 1 - 1.8 * dt);
       player.y += player.vy * dt;
-      const puffTarget = clamp((blow - 0.82) / 0.18, 0, 1);
+      const puffTarget = jetOn ? clamp((jetStrength() - 0.55) / 0.45, 0, 1) : 0;
       player.puff += (puffTarget - player.puff) * Math.min(1, dt * 5);
       const r = baseR * (1 + 0.32 * player.puff);
       if (player.y < r * 0.9) { player.y = r * 0.9; if (player.vy < 0) player.vy = 0; }
 
-      if (blow > 0.2 && Math.random() < dt * 22) {
-        parts.push({ kind: 'air', x: player.x + rand(-0.5, 0.5) * r, y: player.y + r * 0.8,
-          vx: -speed * 0.5, vy: H * rand(0.12, 0.25), life: rand(0.35, 0.6), r: rand(3, 6) });
+      if (flow > 0.3 && Math.random() < dt * 26) {
+        // gust puffs leaving the nozzle
+        parts.push({ kind: 'air', x: player.x + rand(-0.5, 0.5) * baseR, y: groundY - 4,
+          vx: rand(-0.04, 0.04) * H, vy: -H * rand(0.7, 1.0), life: rand(0.3, 0.5), r: rand(3, 7) });
+      } else if (flow < -0.3 && Math.random() < dt * 14) {
+        // wisps torn off Puff and pulled down
+        parts.push({ kind: 'air', x: player.x + rand(-0.7, 0.7) * r, y: player.y + r * 0.7,
+          vx: 0, vy: H * rand(0.5, 0.8), life: rand(0.3, 0.5), r: rand(2.5, 5) });
       }
 
       dist += speed * dt;
@@ -601,7 +654,7 @@ h2 {
         if (hits(o, player.x, player.y, hr)) { endGame(); break; }
       }
       obstacles = obstacles.filter((o) => o.x > -H * 0.4);
-      if (state === 'play' && player.y + r * 0.7 > groundY) endGame();
+      if (state === 'play' && player.y + r * 0.7 > groundY) endGame('vac');
     } else {
       overT += dt;
       if (overT > 0.8 && overEl.hidden) { overEl.hidden = false; hud.hidden = true; }
@@ -790,6 +843,111 @@ h2 {
     ctx.fillRect(o.x - L * 0.53, o.y - h * (0.4 + 1.2 * Math.abs(Math.sin(t * 40))), L * 0.03, h * (0.8 + 2.4 * Math.abs(Math.sin(t * 40))));
   }
 
+  function roundRect(x, y, w, h, rad) {
+    ctx.beginPath();
+    ctx.moveTo(x + rad, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rad);
+    ctx.arcTo(x + w, y + h, x, y + h, rad);
+    ctx.arcTo(x, y + h, x, y, rad);
+    ctx.arcTo(x, y, x + w, y, rad);
+    ctx.closePath();
+    ctx.fill();
+  }
+  function vacGeom() {
+    const gh = H - groundY;
+    const bh = gh * 0.56, bw = bh * 1.5;
+    return { gh, bh, bw, by: H - gh * 0.16 - bh, my: groundY - gh * 0.04, mw: bw * 0.42 };
+  }
+  // Continuous streaks: downward and converging while it sucks, upward and spreading while it gusts.
+  function drawAir() {
+    const v = vacGeom();
+    const r = baseR * (1 + 0.32 * player.puff);
+    const yb = v.my, yt = Math.max(6, player.y - r * 2.2);
+    if (yb - yt < 10) return;
+    const mag = Math.abs(flow), up = flow > 0;
+    ctx.fillStyle = up ? 'rgba(255,255,255,' + ((jetT >= 0 ? 0.38 : 0.16) * mag) + ')' : 'rgba(34,50,77,' + (0.07 * mag) + ')';
+    ctx.beginPath();
+    ctx.moveTo(player.x - v.mw * 0.8, yb); ctx.lineTo(player.x - r * 1.6, yt);
+    ctx.lineTo(player.x + r * 1.6, yt); ctx.lineTo(player.x + v.mw * 0.8, yb);
+    ctx.closePath(); ctx.fill();
+    ctx.lineCap = 'round';
+    for (const k of streaks) {
+      const hw = lerp(v.mw * 0.7, r * 1.5, Math.pow(k.s, 0.7));
+      const x = player.x + k.u * hw, y = lerp(yb, yt, k.s);
+      const L = k.len * (yb - yt) * (up ? 1.4 : 1);
+      const a = Math.sin(Math.PI * k.s) * mag * (up ? 0.95 : 0.6);
+      const col = up ? '255,255,255' : '226,238,248';
+      ctx.strokeStyle = 'rgba(' + col + ',' + a + ')';
+      ctx.lineWidth = k.w * (up ? 1.7 : 1);
+      // tail trails behind the direction of travel
+      const tailY = up ? Math.min(yb, y + L) : Math.max(yt, y - L);
+      const tailHw = lerp(v.mw * 0.7, r * 1.5, Math.pow(clamp((yb - tailY) / (yb - yt), 0, 1), 0.7));
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(player.x + k.u * tailHw, tailY); ctx.stroke();
+      ctx.fillStyle = 'rgba(' + col + ',' + Math.min(1, a * 1.3) + ')';
+      circle(x, y, k.w * (up ? 1.5 : 1.1));
+    }
+  }
+  function drawVacuum() {
+    const v = vacGeom(), gh = v.gh, bh = v.bh, bw = v.bw;
+    const suck = Math.max(0, -flow), gust = Math.max(0, flow);
+    ctx.save();
+    ctx.translate(player.x + Math.sin(t * 60) * 1.4 * suck, Math.sin(t * 47) * 0.8 * suck);
+    // wheels
+    const wy = H - gh * 0.15, wr = gh * 0.11;
+    for (const sx of [-1, 1]) {
+      ctx.fillStyle = '#22324d'; circle(sx * bw * 0.3, wy, wr);
+      ctx.fillStyle = '#8f9bb3'; circle(sx * bw * 0.3, wy, wr * 0.4);
+      const wa = scroll / Math.max(wr, 1);
+      ctx.strokeStyle = '#8f9bb3'; ctx.lineWidth = Math.max(1.5, wr * 0.18);
+      ctx.beginPath();
+      ctx.moveTo(sx * bw * 0.3 - Math.cos(wa) * wr * 0.8, wy - Math.sin(wa) * wr * 0.8);
+      ctx.lineTo(sx * bw * 0.3 + Math.cos(wa) * wr * 0.8, wy + Math.sin(wa) * wr * 0.8);
+      ctx.stroke();
+    }
+    // nozzle: neck widening to an upturned mouth
+    ctx.fillStyle = '#4f4270';
+    ctx.beginPath();
+    ctx.moveTo(-bw * 0.15, v.by + bh * 0.2); ctx.lineTo(-v.mw, v.my);
+    ctx.lineTo(v.mw, v.my); ctx.lineTo(bw * 0.15, v.by + bh * 0.2);
+    ctx.closePath(); ctx.fill();
+    ctx.fillStyle = '#22324d';
+    ctx.beginPath(); ctx.ellipse(0, v.my, v.mw, gh * 0.05, 0, 0, TAU); ctx.fill();
+    ctx.fillStyle = gust > 0.3 ? '#fff6d6' : '#0f1a2e';
+    ctx.beginPath(); ctx.ellipse(0, v.my, v.mw * 0.78, gh * 0.03, 0, 0, TAU); ctx.fill();
+    // body, puffing out a little while it blows
+    const sw = 1 + 0.07 * gust;
+    ctx.fillStyle = '#7b5ea7';
+    roundRect(-bw * sw / 2, v.by, bw * sw, bh, bh * 0.36);
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    roundRect(-bw * sw / 2 + bh * 0.12, v.by + bh * 0.1, bw * sw * 0.5, bh * 0.14, bh * 0.07);
+    // face
+    const ex = bw * 0.2, ey = v.by + bh * 0.46, er = bh * 0.17;
+    ctx.fillStyle = '#fff';
+    circle(-ex, ey, er); circle(ex, ey, er);
+    ctx.fillStyle = '#22324d';
+    circle(-ex, ey - er * 0.35, er * 0.5); circle(ex, ey - er * 0.35, er * 0.5);
+    ctx.strokeStyle = '#22324d';
+    ctx.lineWidth = Math.max(2, bh * 0.07);
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    // brows: scowling inward while sucking, lifted while blowing
+    const bi = lerp(er * 1.25, er * 1.0, suck) , bo = lerp(er * 1.25, er * 1.7, suck);
+    ctx.moveTo(-ex - er, ey - bo - er * 0.5 * gust); ctx.lineTo(-ex + er * 0.9, ey - bi - er * 0.5 * gust);
+    ctx.moveTo(ex + er, ey - bo - er * 0.5 * gust); ctx.lineTo(ex - er * 0.9, ey - bi - er * 0.5 * gust);
+    ctx.stroke();
+    if (gust > 0.3) {
+      ctx.fillStyle = 'rgba(240,130,140,0.7)';
+      circle(-bw * 0.36, ey + er * 1.1, er * 0.55); circle(bw * 0.36, ey + er * 1.1, er * 0.55);
+      ctx.fillStyle = '#22324d';
+      circle(0, ey + er * 1.35, er * 0.42);
+    } else {
+      ctx.beginPath();
+      ctx.arc(0, ey + er * 0.9, er * 0.8, Math.PI * 0.15, Math.PI * 0.85);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   const LUMPS = [[-0.78, 0.2, 0.62], [0.8, 0.22, 0.58], [-0.3, -0.42, 0.62], [0.36, -0.34, 0.56], [0, 0.05, 0.86]];
   function drawPuff() {
     const r = baseR * (1 + 0.32 * player.puff);
@@ -807,7 +965,7 @@ h2 {
     ctx.beginPath(); ctx.ellipse(r * 0.52, r * 0.2, r * (0.13 + 0.05 * blow), r * 0.09, 0, 0, TAU); ctx.fill();
     // eyes
     ctx.fillStyle = '#22324d';
-    const closed = player.blink < 0 || blow > 0.85;
+    const closed = player.blink < 0 || jetT >= 0;
     if (closed) {
       ctx.strokeStyle = '#22324d';
       ctx.lineWidth = Math.max(2, r * 0.06);
@@ -821,11 +979,11 @@ h2 {
       ctx.fillStyle = '#fff';
       circle(-r * 0.265, -r * 0.03, r * 0.03); circle(r * 0.315, -r * 0.03, r * 0.03);
     }
-    // mouth
-    if (blow > 0.25) {
+    // mouth: a worried little o while the vacuum has her, a smile once the gust arrives
+    if (state === 'play' && blow <= 0.25 && jetT < 0) {
       ctx.fillStyle = '#22324d';
       ctx.beginPath();
-      ctx.ellipse(0, r * 0.27, r * (0.06 + 0.04 * blow), r * (0.07 + 0.05 * blow), 0, 0, TAU);
+      ctx.ellipse(0, r * 0.27, r * 0.07, r * 0.09, 0, 0, TAU);
       ctx.fill();
     } else {
       ctx.strokeStyle = '#22324d';
@@ -842,9 +1000,10 @@ h2 {
     drawSky();
     for (const o of obstacles) if (o.type === 'storm') drawStorm(o);
     drawGround();
+    for (const o of obstacles) if (o.type === 'mill') drawMill(o);
+    if (state !== 'over') drawAir();
     for (const o of obstacles) {
-      if (o.type === 'mill') drawMill(o);
-      else if (o.type === 'bird') drawBird(o);
+      if (o.type === 'bird') drawBird(o);
       else if (o.type === 'plane') drawPlane(o);
     }
     for (const p of parts) {
@@ -853,6 +1012,7 @@ h2 {
       circle(p.x, p.y, p.r);
     }
     if (state !== 'over') drawPuff();
+    drawVacuum();
   }
 
   // ---------- loop ----------
